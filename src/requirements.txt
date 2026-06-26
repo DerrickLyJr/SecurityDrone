@@ -1,0 +1,8 @@
+# Core Python dependencies for scripts/
+torch
+
+# NOTE: The following dependencies are part of NVIDIA Isaac Sim / Omniverse
+# and are not available via standard pip install in a normal Python venv.
+# Install Isaac Sim using NVIDIA's installer or Omniverse package manager.
+# omni.kit
+# isaacsim
