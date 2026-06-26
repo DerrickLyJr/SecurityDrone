@@ -92,6 +92,7 @@ def main():
     # 2. Dynamic Environment Routing based on your machine type
     if AWS_MODE:
         print("[INFO] Launching real Isaac Sim production instance on AWS...")
+        import tello_isaaclab_task  # noqa: F401  (registers "TelloAdaptiveTracking" with gymnasium)
         raw_env = load_isaaclab_env(task_name="TelloAdaptiveTracking", headless=args.headless)
         env = wrap_env(raw_env)
     else:
