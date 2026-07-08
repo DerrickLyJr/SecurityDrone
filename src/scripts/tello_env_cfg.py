@@ -1,204 +1,210 @@
+# /home/dlyerly/SecurityDrone/src/scripts/tello_low_level_env.py
 import torch
 import gymnasium as gym
 from collections import deque
+from configs.tello_curriculum import TelloCurriculumManager
 
-class TelloAdaptiveEnv(gym.Env):
+class TelloLowLevelEnv(gym.Env):
     def __init__(self, num_envs=2048, device="cuda"):
         super().__init__()
         self.num_envs = num_envs
         self.device = device
         
-        # Default control mode (can be toggled to "waypoint" later)
-        self.control_mode = "velocity" 
-        
-        # Dimensions (7 features for hybrid action layer)
-        self.observation_space_dim = 6
-        self.action_space_dim = 7  # Expanded to handle hybrid space natively
+        # --- DEFINITIONS ---
+        # Obs: [Rel_XYZ (3), Lin_Vel (3), Ang_Vel (3), Downsampled_Depth (32)] = 41 Prev_Action (4): [v_x, v_y, v_z, w_z]
+        self.observation_space_dim = 45
+        # Actions: [v_x, v_y, v_z, w_z] = 4
+        self.action_space_dim = 4 
 
         self.observation_space = gym.spaces.Box(
-            low=-float('inf'), 
-            high=float('inf'), 
-            shape=(self.observation_space_dim,), 
-            dtype=float
+            low=-float('inf'), high=float('inf'), shape=(self.observation_space_dim,), dtype=float
         )
-        
-        # 7 actions: [roll, pitch, throttle, yaw, X_tgt, Y_tgt, Z_tgt]
         self.action_space = gym.spaces.Box(
-            low=-1.0, 
-            high=1.0, 
-            shape=(self.action_space_dim,), 
-            dtype=float
+            low=-1.0, high=1.0, shape=(self.action_space_dim,), dtype=float
         )
         
-        # --- PERFORMANCE-BASED TRACKING ---
+        # --- CURRICULUM & TRACKING ---
         self.difficulty_factor = 0.0  
-        self.success_window = deque(maxlen=100) 
-        
-        # --- LATENCY BUFFER ---
-        self.max_latency_steps = 5    
-        self.obs_history = []         
-        
-        # Ground truth buffers allocated directly on GPU
-        self.drone_pos = torch.zeros((self.num_envs, 3), device=self.device)
-        self.drone_vel = torch.zeros((self.num_envs, 3), device=self.device)
-        self.target_pos = torch.zeros((self.num_envs, 3), device=self.device)
-        self.target_vel = torch.zeros((self.num_envs, 3), device=self.device)
+        self.success_window = deque(maxlen=100)
         self.episode_steps = torch.zeros(self.num_envs, device=self.device)
         
-        # Mock view placeholders (Isaac Lab injects the real views during instantiation)
+        # --- STATE BUFFERS ---
+        self.drone_pos = torch.zeros((self.num_envs, 3), device=self.device)
+        self.drone_vel = torch.zeros((self.num_envs, 3), device=self.device)
+        self.drone_ang_vel = torch.zeros((self.num_envs, 3), device=self.device)
+        self.target_pos = torch.zeros((self.num_envs, 3), device=self.device)
+        
+        # 1x32 Downsampled Depth Array Vector Placeholder
+        self.depth_inputs = torch.ones((self.num_envs, 32), device=self.device) * 5.0 # Max range 5m
+        
+        # --- LATENCY ACTION QUEUE ---
+        self.max_queue_len = 5
+        # Pre-fill action history queue matrices [Max_Steps, Num_Envs, Action_Dim]
+        self.action_queue = torch.zeros((self.max_queue_len, self.num_envs, self.action_space_dim), device=self.device)
+        self.step_delay_per_env = torch.zeros(self.num_envs, dtype=torch.long, device=self.device)
+
+        # Isaac Lab View References
         self.drone_view = None 
         self.target_view = None
 
-    def _get_success_rate(self):
-        if not self.success_window:
-            return 0.0
-        return sum(self.success_window) / len(self.success_window)
-
-    def _update_curriculum(self):
-        success_rate = self._get_success_rate()
-        if success_rate > 0.85 and self.difficulty_factor < 1.0:
-            self.difficulty_factor = min(1.0, self.difficulty_factor + 0.05)
-            print(f"[CURRICULUM UP] Success Rate: {success_rate:.2f}. Difficulty bumped to {self.difficulty_factor:.2f}")
-        elif success_rate < 0.50 and self.difficulty_factor > 0.0:
-            self.difficulty_factor = max(0.0, self.difficulty_factor - 0.05)
-            print(f"[CURRICULUM DOWN] Success Rate: {success_rate:.2f}. Difficulty reduced to {self.difficulty_factor:.2f}")
-
     def compute_observations(self):
-        rel_pos = self.target_pos - self.drone_pos
-        noise_amplitude = 0.15 * self.difficulty_factor
+        """Processes depth dropout, state estimation drift, and IMU noise."""
+        TelloCurriculumManager.apply_domain_randomization(self)
         
-        pos_noise = torch.randn_like(rel_pos) * noise_amplitude
-        vel_noise = torch.randn_like(self.drone_vel) * noise_amplitude
+        # State Estimation Drift (Relative Target Position)
+        real_rel_pos = self.target_pos - self.drone_pos
+        pos_noise = torch.randn_like(real_rel_pos) * self.pos_noise_sigma
+        noisy_rel_pos = real_rel_pos + pos_noise
         
-        noisy_rel_pos = rel_pos + pos_noise
-        noisy_vel = self.drone_vel + vel_noise
+        # IMU Reading Noise (Linear and Angular Velocities)
+        noisy_lin_vel = self.drone_vel + (torch.randn_like(self.drone_vel) * self.vel_noise_sigma)
+        noisy_ang_vel = self.drone_ang_vel + (torch.randn_like(self.drone_ang_vel) * self.vel_noise_sigma)
         
-        current_perfect_obs = torch.cat([noisy_rel_pos, noisy_vel], dim=-1)
-        self.obs_history.append(current_perfect_obs.clone())
-        
-        current_delay = int(self.difficulty_factor * self.max_latency_steps)
-        if len(self.obs_history) > current_delay:
-            delayed_obs = self.obs_history.pop(0)
-        else:
-            delayed_obs = self.obs_history[0]
-            
-        return delayed_obs
-    
+        # Camera Glare/Compression Dropout Masking
+        noisy_depth = self.depth_inputs.clone()
+        dropout_mask = torch.rand_like(noisy_depth) < self.depth_dropout_prob
+        # Randomly blind elements by forcing them to 0.0 (total glare drop)
+        noisy_depth[dropout_mask] = 0.0
+
+        # Most recently injected action (zeros on reset)
+        prev_action = self.action_queue[0]
+
+        return torch.cat([noisy_rel_pos, noisy_lin_vel, noisy_ang_vel, noisy_depth, prev_action], dim=-1)
+
     def reset(self, seed=None, options=None):
-        """Resets the entire vector of environments globally at the start of an experiment."""
-        # Standard Gymnasium seed initialization
         if seed is not None:
             super().reset(seed=seed)
         
-        # 1. Reset all state tracking steps
         self.episode_steps.fill_(0)
-        
-        # 2. Reset Drones to their starting launch pad positions (0.0, 0.0, 1.0)
         self.drone_pos.fill_(0.0)
-        self.drone_pos[:, 2] = 1.0  # Float hover altitude at 1 meter
+        self.drone_pos[:, 2] = 1.0  # Launch hover altitude
         self.drone_vel.fill_(0.0)
+        self.drone_ang_vel.fill_(0.0)
+        self.action_queue.fill_(0.0)
         
-        # 3. Reset Targets nearby using initial difficulty metrics
-        max_spawn_radius = 2.0 + (self.difficulty_factor * 8.0)
-        random_offsets = (torch.rand((self.num_envs, 2), device=self.device) * 2.0 - 1.0) * max_spawn_radius
+        # Initial step delays randomly sampled between 1 and current max latency
+        TelloCurriculumManager.apply_domain_randomization(self)
+        self.step_delay_per_env = torch.randint(1, self.current_max_latency + 1, (self.num_envs,), device=self.device)
         
-        self.target_pos[:, 0] = self.drone_pos[:, 0] + random_offsets[:, 0]
-        self.target_pos[:, 1] = self.drone_pos[:, 1] + random_offsets[:, 1]
-        self.target_pos[:, 2] = 1.0  # Human standing height coordinate
-        self.target_vel.fill_(0.0)
+        # Spawn targets randomly within tracking zone
+        self.target_pos[:, 0] = (torch.rand(self.num_envs, device=self.device) * 2.0 - 1.0) * 5.0
+        self.target_pos[:, 1] = (torch.rand(self.num_envs, device=self.device) * 2.0 - 1.0) * 5.0
+        self.target_pos[:, 2] = 1.0 + (torch.rand(self.num_envs, device=self.device) * 2.0 - 1.0) * 0.5
         
-        # 4. Clear memory arrays inside your Wi-Fi latency buffer history
-        self.obs_history.clear()
-        
-        # 5. Push initial configurations down to the PhysX core if views are initialized
         if self.drone_view is not None and self.target_view is not None:
-            # Generate whole-buffer index masks matching all active environments [0, 1, ..., num_envs-1]
             all_indices = torch.arange(self.num_envs, dtype=torch.int32, device=self.device)
             self.drone_view.set_world_poses(self.drone_pos, indices=all_indices)
             self.target_view.set_world_poses(self.target_pos, indices=all_indices)
             
-        # 6. Compute initial observations state frame
-        initial_obs = self.compute_observations()
-        
-        # 7. Return standard Gymnasium tuple structure
-        return initial_obs, {"difficulty": self.difficulty_factor, "success_rate": self._get_success_rate()}
+        return self.compute_observations(), {"difficulty": self.difficulty_factor}
 
     def step(self, actions):
         self.episode_steps += 1
-        
-        # --- MOVING TARGET LOGIC ---
-        if self.difficulty_factor > 0.2:
-            target_evasion_speed = 2.0 * self.difficulty_factor 
-            random_drift = (torch.rand_like(self.target_vel) * 2.0 - 1.0) * target_evasion_speed
-            self.target_pos += random_drift * 0.016 
-            
         actions = torch.clamp(actions, min=-1.0, max=1.0)
-        physx_velocity_cmds = torch.zeros((self.num_envs, 6), device=self.device)
         
-        if self.control_mode == "velocity":
-            physx_velocity_cmds[:, 0] = actions[:, 1] * 2.0   # Pitch -> X
-            physx_velocity_cmds[:, 1] = actions[:, 0] * 2.0   # Roll -> Y
-            physx_velocity_cmds[:, 2] = actions[:, 2] * 1.5   # Throttle -> Z
-            physx_velocity_cmds[:, 5] = actions[:, 3] * 3.14  # Yaw -> Spin Z
-        elif self.control_mode == "waypoint":
-            local_target_waypoints = actions[:, 4:7] * 5.0 
-            time_to_reach = 2.0  
-            physx_velocity_cmds[:, 0:3] = local_target_waypoints / time_to_reach
-            physx_velocity_cmds[:, 5] = 0.0 
-            
+        # 1. --- ACTION HISTORY LATENCY QUEUE SHIFT ---
+        # Roll queue forward along step dimension
+        self.action_queue = torch.roll(self.action_queue, shifts=1, dims=0)
+        self.action_queue[0] = actions  # Inject current freshest step command
+        
+        # Extract individual delayed indexes matching each environment's latency budget
+        # Using advanced indexing to pluck out specific time delays per env row
+        delayed_actions = self.action_queue[self.step_delay_per_env, torch.arange(self.num_envs)]
+        
+        # 2. --- AERODYNAMIC DISTURBANCE (WIND INJECTIONS) ---
+        if self.drone_view is not None and self.wind_probability > 0.0:
+            # Sample which environment instances get smacked by air drafts this frame
+            gust_mask = torch.rand(self.num_envs, device=self.device) < self.wind_probability
+            if gust_mask.any():
+                num_gusts = gust_mask.sum().item()
+                # Apply random force vectors (X, Y, Z)scaled by curriculum peak force limits
+                random_forces = (torch.rand((num_gusts, 3), device=self.device) * 2.0 - 1.0) * self.wind_force_magnitude
+                # Inject directly into PhysX body indices via Isaac Sim C++ backend structures
+                gust_indices = gust_mask.nonzero().flatten().to(torch.int32)
+                self.drone_view.apply_forces(random_forces, indices=gust_indices)
+
+        # Map delayed action variables to PhysX velocity commands
+        physx_velocity_cmds = torch.zeros((self.num_envs, 6), device=self.device)
+        physx_velocity_cmds[:, 0] = delayed_actions[:, 0] * 3.0  # Max v_x = 3.0 m/s
+        physx_velocity_cmds[:, 1] = delayed_actions[:, 1] * 3.0  # Max v_y = 3.0 m/s
+        physx_velocity_cmds[:, 2] = delayed_actions[:, 2] * 2.0  # Max v_z = 2.0 m/s
+        physx_velocity_cmds[:, 5] = delayed_actions[:, 3] * 3.14 # Max w_z = pi rad/s
+        
         if self.drone_view is not None:
             self.drone_view.set_velocities(physx_velocity_cmds)
-        
-        # 1. Force distances and headings to flat 1D views to ensure mathematical subtraction doesn't broadcast
+            
+        # 3. --- WAYPOINT SNAPPING PATTERN ENGINE ---
         distances = torch.norm(self.target_pos - self.drone_pos, dim=-1).view(-1)
         headings = torch.atan2(self.target_pos[:, 1] - self.drone_pos[:, 1], self.target_pos[:, 0] - self.drone_pos[:, 0]).view(-1)
         
-        # 2. Compute rewards explicitly as a 1D vector (2048,)
-        rewards = (1.0 - torch.abs(headings) / 3.14159) - (0.5 * distances)
-        rewards = rewards.view(-1) # Safety flatten
+        # Detect proximity threshold crossings [num_envs]
+        snap_mask = distances < 0.5
+        snap_env_ids = snap_mask.nonzero(as_tuple=False).flatten()
         
-        # 3. Compute boolean tracking masks explicitly as flat 1D vectors
-        terminated = (distances > 20.0).view(-1)
-        truncated = (self.episode_steps >= 500).view(-1)
-        # Combined mask for your internal vectorized reset tracking logic
-        dones = terminated | truncated
-        successes = (distances < 0.5) & (torch.abs(headings) < 0.2) 
+        if len(snap_env_ids) > 0:
+            # Teleport targets instantly to force sharp banking redirects
+            new_targets = (torch.rand((len(snap_env_ids), 3), device=self.device) * 2.0 - 1.0) * 6.0
+            new_targets[:, 2] = 1.0 + (torch.rand(len(snap_env_ids), device=self.device) * 2.0 - 1.0) * 0.5
+            self.target_pos[snap_env_ids] = new_targets
+            
+            # Re-sample latency budgets for these specific environments to keep PPO predicting
+            self.step_delay_per_env[snap_env_ids] = torch.randint(1, self.current_max_latency + 1, (len(snap_env_ids),), device=self.device)
+            
+            if self.target_view is not None:
+                self.target_view.set_world_poses(self.target_pos[snap_env_ids], indices=snap_env_ids.to(torch.int32))
+                
+            for idx in snap_env_ids:
+                self.success_window.append(1.0) # Confirmed hit
+
+        # Boundary rules and timeouts
+        terminated = (distances > 25.0).view(-1)
+        truncated = (self.episode_steps >= 750).view(-1) # Longer tracks for continuous momentum
         
-        # The tensor reset must run globally *once* using vector indexes, 
-        # not inside a per-env loop. This avoids unnecessary GPU kernel launches and ensures proper tensor updates.
+        # Hard resets for out-of-bounds or terminal timeouts
         reset_env_ids = (terminated | truncated).nonzero(as_tuple=False).flatten()
-
         if len(reset_env_ids) > 0:
-            # Add successful episodes to tracking history window
             for idx in reset_env_ids:
-                self.success_window.append(1.0 if successes[idx] else 0.0)
-                self.episode_steps[idx] = 0
-
-            reset_positions = torch.tensor([0.0, 0.0, 1.0], device=self.device).repeat(len(reset_env_ids), 1)
-            self.drone_pos[reset_env_ids] = reset_positions
+                if not snap_mask[idx]: # If it didn't snap, it failed or timed out
+                    self.success_window.append(0.0)
+            
+            # Standard reset positions
+            self.drone_pos[reset_env_ids] = torch.tensor([0.0, 0.0, 1.0], device=self.device).repeat(len(reset_env_ids), 1)
             self.drone_vel[reset_env_ids] = 0.0
+            self.drone_ang_vel[reset_env_ids] = 0.0
+            self.episode_steps[reset_env_ids] = 0
             
-            max_spawn_radius = 2.0 + (self.difficulty_factor * 8.0) 
-            random_offsets = (torch.rand((len(reset_env_ids), 2), device=self.device) * 2.0 - 1.0) * max_spawn_radius
+            self.target_pos[reset_env_ids, 0] = (torch.rand(len(reset_env_ids), device=self.device) * 2.0 - 1.0) * 5.0
+            self.target_pos[reset_env_ids, 1] = (torch.rand(len(reset_env_ids), device=self.device) * 2.0 - 1.0) * 5.0
+            self.target_pos[reset_env_ids, 2] = 1.0
             
-            self.target_pos[reset_env_ids, 0] = self.drone_pos[reset_env_ids, 0] + random_offsets[:, 0] 
-            self.target_pos[reset_env_ids, 1] = self.drone_pos[reset_env_ids, 1] + random_offsets[:, 1] 
-            self.target_pos[reset_env_ids, 2] = 1.0 
-            
-            self.target_vel[reset_env_ids] = 0.0
-            
-            # 🔥 BUG FIX 3: Add conditional guards so testing/mock scripts won't crash before PhysX views boot up
             if self.drone_view is not None and self.target_view is not None:
-                self.drone_view.set_world_poses(self.drone_pos[reset_env_ids], indices=reset_env_ids)
-                self.target_view.set_world_poses(self.target_pos[reset_env_ids], indices=reset_env_ids)
-        
-        self._update_curriculum()
+                self.drone_view.set_world_poses(self.drone_pos[reset_env_ids], indices=reset_env_ids.to(torch.int32))
+                self.target_view.set_world_poses(self.target_pos[reset_env_ids], indices=reset_env_ids.to(torch.int32))
+
+        # Dynamic metric updates
+        success_rate = sum(self.success_window) / len(self.success_window) if self.success_window else 0.0
+        if success_rate > 0.88 and self.difficulty_factor < 1.0:
+            self.difficulty_factor = min(1.0, self.difficulty_factor + 0.04)
+        elif success_rate < 0.45 and self.difficulty_factor > 0.0:
+            self.difficulty_factor = max(0.0, self.difficulty_factor - 0.04)
+
+        # 🔥 Call your empty custom reward function placeholder
+        rewards = TelloCurriculumManager.compute_reward(
+            difficulty_factor=self.difficulty_factor,
+            drone_pos=self.drone_pos,
+            target_pos=self.target_pos,
+            drone_vel=self.drone_vel,
+            actions=actions,
+            headings=headings,
+            distances=distances,
+            terminated=terminated
+        )
         next_obs = self.compute_observations()
         
         return (
-            next_obs, 
-            rewards.unsqueeze(-1), 
-            terminated.unsqueeze(-1), 
-            truncated.unsqueeze(-1), 
-            {"difficulty": self.difficulty_factor, "success_rate": self._get_success_rate()}
+            next_obs,
+            rewards.unsqueeze(-1),
+            terminated.unsqueeze(-1),
+            truncated.unsqueeze(-1),
+            {"difficulty": self.difficulty_factor, "success_rate": success_rate}
         )

@@ -20,7 +20,7 @@ try:
     AWS_MODE = True
 except ImportError:
     # Safe fallback for your local development sandbox
-    from local_mock.env_wrapper import SkrlVecEnvWrapper
+    from scripts.local_mock.env_wrapper import SkrlVecEnvWrapper
     AWS_MODE = False
 
 # --- Framework-Compliant Model Implementations ---
@@ -92,13 +92,13 @@ def main():
     # 2. Dynamic Environment Routing based on your machine type
     if AWS_MODE:
         print("[INFO] Launching real Isaac Sim production instance on AWS...")
-        import tello_isaaclab_task  # noqa: F401  (registers "TelloAdaptiveTracking" with gymnasium)
+        import scripts.tello_isaaclab_task  # noqa: F401  (registers "TelloAdaptiveTracking" with gymnasium)
         raw_env = load_isaaclab_env(task_name="TelloAdaptiveTracking", headless=args.headless)
         env = wrap_env(raw_env)
     else:
         print("[INFO] Running in local mock sandbox environment context...")
-        from tello_env_cfg import TelloAdaptiveEnv 
-        raw_env = TelloAdaptiveEnv(num_envs=2048, device=args.device)
+        from scripts.tello_env_cfg import TelloLowLevelEnv 
+        raw_env = TelloLowLevelEnv(num_envs=2048, device=args.device)
         env = SkrlVecEnvWrapper(raw_env)
 
     # 3. Load production parameters from configuration file
@@ -136,7 +136,8 @@ def main():
         memory=memory,
         cfg=agent_cfg,
         observation_space=env.observation_space,
-        action_space=env.action_space
+        action_space=env.action_space,
+        state_space=env.state_space
     )
 
     # 1. Import the explicit loop trainer at the top of your script or right here
